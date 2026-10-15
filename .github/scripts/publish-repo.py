@@ -3,6 +3,7 @@ import hashlib
 import html
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -18,7 +19,9 @@ ARTIFACTS_DIR = Path.home() / "apk-artifacts"
 # The checked-out `repo` branch we publish into (the working directory).
 REPO_DIR = Path.cwd()
 
-ICON_BASE_URL = "https://cdn.jsdelivr.net/gh/keiyoushi/extensions-source@main"
+SOURCE_REPOSITORY = os.getenv("SOURCE_REPOSITORY", "keiyoushi/extensions-source")
+SOURCE_REF = os.getenv("SOURCE_REF", "main")
+ICON_BASE_URL = f"https://raw.githubusercontent.com/{SOURCE_REPOSITORY}/{SOURCE_REF}"
 RELEASE_BASE_URL = f"https://github.com/{REPO_NAME}/releases/download"
 ASSET_LIMIT = 495  # Actual limit is 1000 but we upload 2 items per extension.
 UPLOAD_CHUNK_SIZE = 80
@@ -31,9 +34,16 @@ current_sha_short = current_sha[:7]
 # nothing is carried over from the published index. This is what drops extensions deleted
 # from the source tree, which a diff against the empty tree can't see.
 full_rebuild = sys.argv[3] == "true"
+store_name = os.getenv("STORE_NAME", "Keiyoushi")
+store_badge = os.getenv("STORE_BADGE", "KEI")
+store_signing_key = os.getenv("STORE_SIGNING_KEY", "9add655a78e96c4ec7a53ef89dccb557cb5d767489fac5e785d671a5a75d4da2")
+store_website = os.getenv("STORE_WEBSITE", "https://keiyoushi.github.io")
 
 with REPO_DIR.joinpath("index.json").open() as f:
     remote_proto = json_format.Parse(f.read(), index_pb2.Index())
+
+if not full_rebuild and remote_proto.extensionList.extensions and remote_proto.signingKey != store_signing_key:
+    raise ValueError("Signing key changed: a full rebuild is required before publishing")
 
 remote_extensions = {
     ext.packageName: ext for ext in remote_proto.extensionList.extensions
@@ -57,6 +67,7 @@ updated_release_assets = {
 # source-info JSON emitted by its assembleRelease task (see GenerateSourceInfoTask); its APK is a
 # sibling in the same build dir. aapt reads the icon out of the APK
 new_extensions: list[tuple[index_pb2.Extension, Path, Path, bool, bool]] = []
+built_modules: set[str] = set()
 
 SOURCE_DIR = Path(__file__).resolve().parents[2]
 ICON_FILE = "res/mipmap-xhdpi/ic_launcher.png"
@@ -79,6 +90,7 @@ for info_file in ARTIFACTS_DIR.glob("**/keiyoushi-source-info.json"):
     with info_file.open(encoding="utf-8") as f:
         info = json.load(f)
     package_name = info["packageName"]
+    built_modules.add(info["module"])
     apk = next((info_file.parent / "outputs/apk/release").glob("*.apk"), None)
     if apk is None:
         raise FileNotFoundError(
@@ -138,6 +150,15 @@ for info_file in ARTIFACTS_DIR.glob("**/keiyoushi-source-info.json"):
 
 new_extensions.sort(key=lambda item: item[0].packageName)
 
+if expected_matrix := os.getenv("EXPECTED_MATRIX"):
+    expected_modules = {
+        module.removeprefix(":src:").replace(":", ".")
+        for chunk in json.loads(expected_matrix)["chunk"]
+        for module in chunk["modules"]
+    }
+    if built_modules != expected_modules:
+        raise ValueError(f"Build artifacts do not match the requested modules: missing={expected_modules - built_modules}, unexpected={built_modules - expected_modules}")
+
 changed_extensions = [item for item in new_extensions if item[3] or item[4]]
 total_changed_extensions = len(changed_extensions)
 release_count = (
@@ -189,27 +210,39 @@ final_extensions.extend(ext for ext, _, _, _, _ in new_extensions)
 final_extensions.sort(key=lambda ext: ext.packageName)
 
 index = index_pb2.Index(
-    name="Keiyoushi",
-    badgeLabel="KEI",
-    signingKey="9add655a78e96c4ec7a53ef89dccb557cb5d767489fac5e785d671a5a75d4da2",
+    name=store_name,
+    badgeLabel=store_badge,
+    signingKey=store_signing_key,
     contact=index_pb2.Contact(
-        website="https://keiyoushi.github.io",
-        discord="https://discord.gg/3FbCpdKbdY",
+        website=store_website,
     ),
     extensionList=index_pb2.ExtensionList(extensions=final_extensions),
 )
+if SOURCE_REPOSITORY == "keiyoushi/extensions-source":
+    index.contact.discord = "https://discord.gg/3FbCpdKbdY"
 
 with REPO_DIR.joinpath("index.json").open("w", encoding="utf-8") as f:
     f.write(
         json_format.MessageToJson(
             index,
-            always_print_fields_with_no_presence=False,
+            always_print_fields_with_no_presence=True,
             preserving_proto_field_name=True,
         )
     )
 
 with REPO_DIR.joinpath("index.pb").open("wb") as f:
     f.write(gzip.compress(index.SerializeToString(deterministic=True), mtime=0))
+
+with REPO_DIR.joinpath("repo.json").open("w", encoding="utf-8") as f:
+    json.dump({
+        "index_v2": f"https://raw.githubusercontent.com/{REPO_NAME}/repo/index.pb",
+        "meta": {
+            "name": store_name,
+            "website": store_website,
+            "signingKeyFingerprint": store_signing_key,
+        },
+    }, f, indent=2)
+    f.write("\n")
 
 with release_assets_path.open("w", encoding="utf-8") as f:
     json.dump(updated_release_assets, f, indent=2, sort_keys=True)
@@ -255,7 +288,7 @@ def create_release(tag: str):
         "--title",
         f"Repository Update {tag}",
         "--notes",
-        f"Automated update from keiyoushi/extensions-source@{current_sha}",
+        f"Automated update from {SOURCE_REPOSITORY}@{current_sha}",
     )
 
 
